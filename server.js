@@ -1,10 +1,10 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -19,8 +19,7 @@ mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(() => console.log("MongoDB connected successfully!"))
     .catch(err => console.error("MongoDB connection error:", err));
 
-// --- Mongoose Schemas & Models ---
-
+// --- Schemas & Models ---
 const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
@@ -54,23 +53,23 @@ const diarySchema = new mongoose.Schema({
 });
 const Diary = mongoose.model('Diary', diarySchema);
 
+// --- TMDB Helpers ---
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 
-// --- API Routes ---
-
-// -- Auth Routes --
+// --- Auth Routes ---
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password } = req.body;
         const existingUser = await User.findOne({ email });
-        if (existingUser) {
-            return res.status(400).json({ message: "User with this email already exists." });
-        }
+        if (existingUser) return res.status(400).json({ message: "User already exists." });
+
         const hashedPassword = await bcrypt.hash(password, 12);
         const username = email.split('@')[0];
         const newUser = new User({ email, password: hashedPassword, username });
         await newUser.save();
         res.status(201).json({ message: "User created successfully!" });
-    } catch (error) {
+    } catch (err) {
         res.status(500).json({ message: "Something went wrong." });
     }
 });
@@ -79,22 +78,19 @@ app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         const user = await User.findOne({ email });
-        if (!user) {
-            return res.status(404).json({ message: "User not found." });
-        }
+        if (!user) return res.status(404).json({ message: "User not found." });
+
         const isPasswordCorrect = await bcrypt.compare(password, user.password);
-        if (!isPasswordCorrect) {
-            return res.status(400).json({ message: "Invalid credentials." });
-        }
+        if (!isPasswordCorrect) return res.status(400).json({ message: "Invalid credentials." });
+
         const token = jwt.sign({ email: user.email, id: user._id }, 'secret_key', { expiresIn: '1h' });
         res.status(200).json({ result: { id: user._id, email: user.email }, token });
-    } catch (error) {
+    } catch (err) {
         res.status(500).json({ message: "Something went wrong." });
     }
 });
 
-
-// -- Review Routes --
+// --- Review Routes ---
 app.get('/api/reviews/:movieId', async (req, res) => {
     try {
         const reviews = await Review.find({ movieId: req.params.movieId }).sort({ createdAt: -1 });
@@ -104,26 +100,31 @@ app.get('/api/reviews/:movieId', async (req, res) => {
     }
 });
 
-// ** NEW ROUTE ADDED HERE **
-app.get('/api/user/:userId/reviews', async (req, res) => {
+app.get('/api/users/:userId/reviews', async (req, res) => {
     try {
         const reviews = await Review.find({ userId: req.params.userId }).sort({ createdAt: -1 });
-        res.json(reviews);
+
+        const reviewsWithMovies = await Promise.all(reviews.map(async (review) => {
+            try {
+                const response = await axios.get(`${TMDB_BASE_URL}/movie/${review.movieId}`, {
+                    params: { api_key: TMDB_API_KEY }
+                });
+                const movie = response.data;
+                return { ...review.toObject(), movie: { id: movie.id, title: movie.title, poster_path: movie.poster_path, release_date: movie.release_date } };
+            } catch {
+                return { ...review.toObject(), movie: { id: review.movieId, title: "Unknown", poster_path: null, release_date: null } };
+            }
+        }));
+
+        res.json(reviewsWithMovies);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
 
-
 app.post('/api/reviews', async (req, res) => {
-    const review = new Review({
-        movieId: req.body.movieId,
-        userId: req.body.userId,
-        username: req.body.username,
-        rating: req.body.rating,
-        text: req.body.text
-    });
     try {
+        const review = new Review(req.body);
         const newReview = await review.save();
         res.status(201).json(newReview);
     } catch (err) {
@@ -131,58 +132,61 @@ app.post('/api/reviews', async (req, res) => {
     }
 });
 
-// -- User Interaction Routes --
-app.get('/api/user/:userId/interactions', async (req, res) => {
+// --- User Interaction Routes ---
+app.get('/api/users/:userId/interactions', async (req, res) => {
     try {
         let interactions = await UserInteraction.findOne({ userId: req.params.userId });
         if (!interactions) {
-            interactions = new UserInteraction({ userId: req.params.userId });
+            interactions = new UserInteraction({ userId: req.params.userId, likes: [], watchlist: [] });
             await interactions.save();
         }
-        res.json(interactions);
+        res.json({
+            likes: interactions.likes || [],
+            watchlist: interactions.watchlist || []
+        });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
 
-app.post('/api/user/:userId/watchlist/toggle', async (req, res) => {
-    const { movieId } = req.body;
-    const { userId } = req.params;
+app.post('/api/users/:userId/watchlist/toggle', async (req, res) => {
     try {
-        const interactions = await UserInteraction.findOne({ userId });
-        const movieIndex = interactions.watchlist.indexOf(movieId);
-        if (movieIndex > -1) {
-            interactions.watchlist.splice(movieIndex, 1);
-        } else {
-            interactions.watchlist.push(movieId);
-        }
+        const { movieId } = req.body;
+        const { userId } = req.params;
+        let interactions = await UserInteraction.findOne({ userId });
+        if (!interactions) interactions = new UserInteraction({ userId, likes: [], watchlist: [] });
+
+        const index = interactions.watchlist.indexOf(movieId);
+        if (index > -1) interactions.watchlist.splice(index, 1);
+        else interactions.watchlist.push(movieId);
+
         await interactions.save();
-        res.json(interactions);
+        res.json({ watchlist: interactions.watchlist });
     } catch (err) {
         res.status(400).json({ message: err.message });
     }
 });
 
-app.post('/api/user/:userId/likes/toggle', async (req, res) => {
-    const { movieId } = req.body;
-    const { userId } = req.params;
+app.post('/api/users/:userId/likes/toggle', async (req, res) => {
     try {
-        const interactions = await UserInteraction.findOne({ userId });
-        const movieIndex = interactions.likes.indexOf(movieId);
-        if (movieIndex > -1) {
-            interactions.likes.splice(movieIndex, 1);
-        } else {
-            interactions.likes.push(movieId);
-        }
+        const { movieId } = req.body;
+        const { userId } = req.params;
+        let interactions = await UserInteraction.findOne({ userId });
+        if (!interactions) interactions = new UserInteraction({ userId, likes: [], watchlist: [] });
+
+        const index = interactions.likes.indexOf(movieId);
+        if (index > -1) interactions.likes.splice(index, 1);
+        else interactions.likes.push(movieId);
+
         await interactions.save();
-        res.json(interactions);
+        res.json({ likes: interactions.likes });
     } catch (err) {
         res.status(400).json({ message: err.message });
     }
 });
 
-// -- Diary Routes --
-app.get('/api/user/:userId/diary', async (req, res) => {
+// --- Diary Routes ---
+app.get('/api/users/:userId/diary', async (req, res) => {
     try {
         const diaryEntries = await Diary.find({ userId: req.params.userId }).sort({ watchedDate: -1 });
         res.json(diaryEntries);
@@ -191,15 +195,9 @@ app.get('/api/user/:userId/diary', async (req, res) => {
     }
 });
 
-app.post('/api/user/:userId/diary', async (req, res) => {
-    const entry = new Diary({
-        userId: req.params.userId,
-        movieId: req.body.movieId,
-        watchedDate: req.body.watchedDate,
-        rating: req.body.rating,
-        reviewText: req.body.reviewText,
-    });
+app.post('/api/users/:userId/diary', async (req, res) => {
     try {
+        const entry = new Diary(req.body);
         const newEntry = await entry.save();
         res.status(201).json(newEntry);
     } catch (err) {
@@ -207,6 +205,25 @@ app.post('/api/user/:userId/diary', async (req, res) => {
     }
 });
 
+// --- User Profile Routes ---
+app.get('/api/users/:userId', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.userId);
+        if (!user) return res.status(404).json({ message: "User not found." });
+        res.json(user);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+app.put('/api/users/:userId', async (req, res) => {
+    try {
+        const updatedUser = await User.findByIdAndUpdate(req.params.userId, req.body, { new: true });
+        res.json(updatedUser);
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
 
 // --- Start Server ---
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

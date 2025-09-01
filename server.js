@@ -14,42 +14,50 @@ app.use(cors());
 app.use(express.json());
 
 // --- MongoDB Connection ---
-const MONGO_URI = process.env.REACT_APP_MONGO_URI;
+const MONGO_URI = process.env.MONGO_URI || process.env.REACT_APP_MONGO_URI;
 mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log("MongoDB connected successfully!"))
-    .catch(err => console.error("MongoDB connection error:", err));
+    .then(() => console.log("✅ MongoDB connected successfully!"))
+    .catch(err => console.error("❌ MongoDB connection error:", err));
 
 // --- Schemas & Models ---
 const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    username: { type: String, required: true, unique: true }
+    username: { type: String, required: true, unique: true },
+    profilePicture: String,
+    joinDate: { type: Date, default: Date.now },
+    watchlist: [{ type: mongoose.Schema.Types.ObjectId, ref: "Movie" }]
 });
 const User = mongoose.model('User', userSchema);
 
+const movieSchema = new mongoose.Schema({
+    title: String,
+    genre: [String],
+    releaseYear: Number,
+    director: String,
+    cast: [String],
+    synopsis: String,
+    posterUrl: String,
+    averageRating: { type: Number, default: 0 }
+});
+const Movie = mongoose.model('Movie', movieSchema);
+
 const reviewSchema = new mongoose.Schema({
-    movieId: { type: String, required: true },
-    userId: { type: String, required: true },
+    movieId: { type: mongoose.Schema.Types.ObjectId, ref: "Movie", required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     username: { type: String, required: true },
-    rating: { type: Number, required: true },
-    text: { type: String },
+    rating: { type: Number, required: true, min: 1, max: 5 },
+    text: String,
     createdAt: { type: Date, default: Date.now }
 });
 const Review = mongoose.model('Review', reviewSchema);
 
-const userInteractionSchema = new mongoose.Schema({
-    userId: { type: String, required: true, unique: true },
-    likes: { type: [String], default: [] },
-    watchlist: { type: [String], default: [] }
-});
-const UserInteraction = mongoose.model('UserInteraction', userInteractionSchema);
-
 const diarySchema = new mongoose.Schema({
-    userId: { type: String, required: true },
-    movieId: { type: String, required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    movieId: { type: mongoose.Schema.Types.ObjectId, ref: "Movie", required: true },
     watchedDate: { type: Date, required: true },
-    rating: { type: Number },
-    reviewText: { type: String },
+    rating: Number,
+    reviewText: String,
 });
 const Diary = mongoose.model('Diary', diarySchema);
 
@@ -74,10 +82,13 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
+// Login
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ message: "User not found." });
+
         if (!user) return res.status(404).json({ message: "User not found." });
 
         const isPasswordCorrect = await bcrypt.compare(password, user.password);
@@ -93,8 +104,17 @@ app.post('/api/auth/login', async (req, res) => {
 // --- Review Routes ---
 app.get('/api/reviews/:movieId', async (req, res) => {
     try {
-        const reviews = await Review.find({ movieId: req.params.movieId }).sort({ createdAt: -1 });
-        res.json(reviews);
+        const { page = 1, limit = 10, genre, year, rating } = req.query;
+        const query = {};
+        if (genre) query.genre = genre;
+        if (year) query.releaseYear = year;
+        if (rating) query.averageRating = { $gte: rating };
+
+        const movies = await Movie.find(query)
+            .skip((page - 1) * limit)
+            .limit(Number(limit));
+
+        res.json(movies);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
